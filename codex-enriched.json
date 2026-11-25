@@ -4736,8 +4736,8 @@
       "name_en": "Chickpeas",
       "brand": "Delhaize",
       "description": "Gekookte kikkererwten.",
-      "category_id": "vegetable.frozen",
-      "category_path": "Food > Vegetables > Frozen",
+      "category_id": "vegetable.canned",
+      "category_path": "Food > Vegetables > Canned",
       "category_raw": "Conserven > Groenten",
       "roles": [
         "vegetable"

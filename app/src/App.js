@@ -1,21 +1,43 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import rows from './data/rows.json';
+import correctedRows from './data/corrected.json';
 import { askMeal } from './lib/askMeal';
 import { enrichAll } from './lib/engine';
 import { pictureFor } from './lib/pictures';
 import './App.css';
 
-const STARTS = [
+const ALLERGIES = [
+  { label: 'Gluten', text: 'gluten', ids: ['gluten'] },
+  { label: 'Milk', text: 'milk', ids: ['milk'] },
+  { label: 'Eggs', text: 'eggs', ids: ['egg', 'eggs'] },
+  { label: 'Nuts', text: 'tree nuts', ids: ['nuts', 'tree_nuts', 'pine_nuts'] },
+  { label: 'Peanuts', text: 'peanuts', ids: ['peanuts'] },
+  { label: 'Fish', text: 'fish', ids: ['fish'] },
+  { label: 'Soy', text: 'soy', ids: ['soy', 'soybeans'] },
+  { label: 'Celery', text: 'celery', ids: ['celery'] },
+  { label: 'Sesame', text: 'sesame', ids: ['sesame'] },
+  { label: 'Shellfish', text: 'crustaceans', ids: ['crustaceans'] },
+  { label: 'Mustard', text: 'mustard', ids: ['mustard'] },
+];
+const GROCERIES = [
   { label: 'Fill the fridge', text: 'Fill the fridge with groceries.' },
   { label: 'Plan the week', text: 'Plan what I will cook this week, then shop the groceries.' },
-  { label: 'I have an allergy', text: 'I have an allergy.' },
 ];
-const GREETING = 'What groceries should go in the fridge?';
 const CATEGORY_RANK = ['Pasta', 'Sauces', 'Vegetables', 'Grains', 'Meat', 'Fish', 'Protein', 'Dairy', 'Eggs', 'Bakery', 'Breakfast', 'Pantry', 'World kitchen', 'Baking', 'Snacks', 'Frozen', 'Ready meals', 'Drinks'];
+const correctedBySku = new Map(correctedRows.map((row) => [row.sku, row]));
 
-function categoryName(product) {
+function hasAllergy(product, allergy) {
+  const present = new Set([
+    ...(product.allergen?.contains || []),
+    ...(product.other_risks || []).map((risk) => risk.id),
+    ...(correctedBySku.get(product.sku)?.allergenen?.bevat || []),
+  ]);
+  return allergy.ids.some((id) => present.has(id));
+}
+
+function categoryParts(product) {
   const parts = String(product.category_path || 'Other').split(' > ').filter((part) => part && part !== 'Food');
-  return parts[0] || 'Other';
+  return { aisle: parts[0] || 'Other', leaf: parts[1] || '' };
 }
 
 function money(value) {
@@ -87,19 +109,6 @@ function writeBasket(basket) {
   }));
 }
 
-function withBands(reply) {
-  if (!reply.baskets) return reply;
-  const baskets = [...reply.baskets].sort((a, b) => sum(a) - sum(b));
-  const priced = sum(baskets[0]) + 0.009 < sum(baskets[1]);
-  return {
-    ...reply,
-    baskets: baskets.map((basket, index) => ({
-      ...basket,
-      band: priced ? (index === 0 ? 'Lower' : 'Higher') : `Basket ${index + 1}`,
-    })),
-  };
-}
-
 function shelfMatch(product, query) {
   const text = query.trim().toLowerCase();
   if (!text) return true;
@@ -109,13 +118,15 @@ function shelfMatch(product, query) {
   return words.some((word) => hay.includes(word));
 }
 
-function useDictation(onText) {
+function useDictation(getText, onText) {
   const [listening, setListening] = useState(false);
   const [note, setNote] = useState('');
   const recRef = useRef(null);
+  const wantRef = useRef(false);
 
   function stop() {
-    recRef.current?.stop();
+    wantRef.current = false;
+    try { recRef.current?.stop(); } catch (err) { /* already ended */ }
     setListening(false);
   }
 
@@ -126,25 +137,42 @@ function useDictation(onText) {
       return;
     }
     setNote('');
-    const rec = new Ctor();
-    rec.lang = navigator.language || 'nl-BE';
-    rec.interimResults = true;
-    rec.continuous = false;
-    let finalText = '';
-    rec.onresult = (event) => {
-      let interim = '';
-      for (let i = event.resultIndex; i < event.results.length; i += 1) {
-        const piece = event.results[i][0].transcript;
-        if (event.results[i].isFinal) finalText += piece;
-        else interim += piece;
+    wantRef.current = true;
+    const base = getText().trim();
+    let spoken = '';
+
+    function listen() {
+      const rec = new Ctor();
+      rec.lang = navigator.language || 'nl-BE';
+      rec.interimResults = true;
+      rec.continuous = true;
+      rec.onresult = (event) => {
+        let interim = '';
+        for (let i = event.resultIndex; i < event.results.length; i += 1) {
+          const piece = event.results[i][0].transcript;
+          if (event.results[i].isFinal) spoken += piece;
+          else interim += piece;
+        }
+        const said = `${spoken}${interim}`.replace(/\s+/g, ' ').trim();
+        onText([base, said].filter(Boolean).join(' '));
+      };
+      rec.onerror = () => {};
+      rec.onend = () => {
+        if (!wantRef.current || recRef.current !== rec) return;
+        setTimeout(() => {
+          if (wantRef.current && recRef.current === rec) listen();
+        }, 200);
+      };
+      recRef.current = rec;
+      try {
+        rec.start();
+      } catch (err) {
+        /* start can throw if the previous session has not released the mic yet */
       }
-      onText((finalText || interim).trim());
-    };
-    rec.onerror = () => setListening(false);
-    rec.onend = () => setListening(false);
-    recRef.current = rec;
+    }
+
     setListening(true);
-    rec.start();
+    listen();
   }
 
   return { listening, note, toggle: listening ? stop : start };
@@ -153,8 +181,11 @@ function useDictation(onText) {
 function App() {
   const products = useMemo(() => enrichAll(rows).products, []);
   const [shelfQuery, setShelfQuery] = useState('');
-  const [category, setCategory] = useState('All');
+  const [aisle, setAisle] = useState('All');
+  const [leaf, setLeaf] = useState('');
   const [draft, setDraft] = useState('');
+  const draftRef = useRef('');
+  draftRef.current = draft;
   const [messages, setMessages] = useState([]);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
@@ -167,20 +198,60 @@ function App() {
   const [receipt, setReceipt] = useState(null);
   const [includeLast, setIncludeLast] = useState(null);
   const [askingInclude, setAskingInclude] = useState(false);
+  const [keyReady, setKeyReady] = useState(null);
+  const [allergies, setAllergies] = useState([]);
+  const [allergyDone, setAllergyDone] = useState(false);
+  const [allergyOpen, setAllergyOpen] = useState(false);
+  const allergyRef = useRef(null);
   const askRef = useRef(null);
   const threadRef = useRef(null);
   const dockRef = useRef(null);
   const panelRef = useRef(null);
   const [panelHeight, setPanelHeight] = useState(0);
-  const dictation = useDictation(setDraft);
-  const categories = useMemo(() => {
-    const present = new Set(products.map(categoryName));
+  const dictation = useDictation(() => draftRef.current, setDraft);
+  const aisles = useMemo(() => {
+    const present = new Set(products.map((item) => categoryParts(item).aisle));
     return CATEGORY_RANK.filter((name) => present.has(name));
   }, [products]);
-  const shelf = useMemo(() => products.filter((item) => (
-    (category === 'All' || categoryName(item) === category) && shelfMatch(item, shelfQuery)
-  )), [products, category, shelfQuery]);
+  const leaves = useMemo(() => {
+    if (aisle === 'All') return [];
+    const names = new Set();
+    products.forEach((item) => {
+      const parts = categoryParts(item);
+      if (parts.aisle === aisle && parts.leaf) names.add(parts.leaf);
+    });
+    return [...names].sort((a, b) => a.localeCompare(b));
+  }, [products, aisle]);
+  const blocked = useMemo(
+    () => ALLERGIES.filter((item) => allergies.includes(item.label)),
+    [allergies],
+  );
+  const shelf = useMemo(() => {
+    const visible = products.filter((item) => {
+      const parts = categoryParts(item);
+      const inAisle = aisle === 'All' || parts.aisle === aisle;
+      const inLeaf = !leaf || parts.leaf === leaf;
+      return inAisle && inLeaf && shelfMatch(item, shelfQuery);
+    });
+    if (!blocked.length) return visible;
+    return visible.slice().sort((a, b) => {
+      const aHit = blocked.some((allergy) => hasAllergy(a, allergy));
+      const bHit = blocked.some((allergy) => hasAllergy(b, allergy));
+      return Number(aHit) - Number(bHit);
+    });
+  }, [products, aisle, leaf, shelfQuery, blocked]);
   useEffect(() => () => askRef.current?.abort(), []);
+
+  useEffect(() => {
+    let gone = false;
+    fetch('/api/assistant')
+      .then((response) => (response.ok ? response.json() : null))
+      .then((body) => {
+        if (!gone && body && typeof body.ready === 'boolean') setKeyReady(body.ready);
+      })
+      .catch(() => {});
+    return () => { gone = true; };
+  }, []);
 
   useEffect(() => {
     writeBasket(basket);
@@ -207,10 +278,11 @@ function App() {
       cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [open, messages, pending, error]);
+  }, [open, messages, pending, error, allergyDone, allergies]);
 
   useEffect(() => {
     function onPointer(event) {
+      if (allergyRef.current && !allergyRef.current.contains(event.target)) setAllergyOpen(false);
       if (pending || basketOpen) return;
       if (dockRef.current && !dockRef.current.contains(event.target)) setOpen(false);
     }
@@ -235,7 +307,7 @@ function App() {
     if (!lastOrder || includeLast == null) return '';
     const lines = lastOrder.items.map((item) => `${item.sku}|${item.product.name}|${item.qty}`).join(', ');
     if (includeLast) {
-      return `This is a new order. Keep every one of these products in both baskets, at least at these quantities: ${lines}. Add whatever else they ask for. Do not ask which day.`;
+      return `This is a new order. Keep every one of these products in the basket, at least at these quantities: ${lines}. Add whatever else they ask for. Do not ask which day.`;
     }
     return `This is a new order. Do not reuse the previous basket (${lines}). Shop only what they ask for now.`;
   }
@@ -258,9 +330,29 @@ function App() {
     };
   }
 
+  function toggleAllergy(label) {
+    setAllergies((current) => (
+      current.includes(label) ? current.filter((item) => item !== label) : [...current, label]
+    ));
+  }
+
+  function toggleShelfAllergy(label) {
+    const next = allergies.includes(label)
+      ? allergies.filter((item) => item !== label)
+      : [...allergies, label];
+    setAllergies(next);
+    if (messages.length === 0) setAllergyDone(next.length > 0);
+  }
+
+  function shopText(base) {
+    if (!allergies.length) return base;
+    const named = ALLERGIES.filter((item) => allergies.includes(item.label)).map((item) => item.text);
+    return `${base} I have an allergy: ${named.join(', ')}.`;
+  }
+
   async function send(text) {
     const request = text.trim();
-    if (!request || pending || askingInclude) return;
+    if (!request || pending || askingInclude || keyReady === false) return;
     if (dictation.listening) dictation.toggle();
     setDraft('');
     setError('');
@@ -273,13 +365,14 @@ function App() {
     const controller = new AbortController();
     askRef.current = controller;
     try {
-      const reply = withBands(mergeOrder(await askMeal({
+      const reply = mergeOrder(await askMeal({
         products,
         turns: history,
         request,
         orderNote: note,
+        avoidIds: blocked.flatMap((item) => item.ids),
         signal: controller.signal,
-      })));
+      }));
       setMessages((current) => current.map((message, index) => (
         index === current.length - 1 ? { request, reply } : message
       )));
@@ -406,25 +499,57 @@ function App() {
       <main className="shelf" aria-label="On the shelf">
         <header>
           <h1>On the shelf</h1>
-          <span>{shelf.length}</span>
+          <div className="shelf-meta" ref={allergyRef}>
+            <span>{shelf.length}</span>
+            <button
+              type="button"
+              className={allergies.length || allergyOpen ? 'allergy-btn on' : 'allergy-btn'}
+              aria-expanded={allergyOpen}
+              onClick={() => setAllergyOpen((current) => !current)}
+            >
+              Allergies{allergies.length ? ` ${allergies.length}` : ''}
+            </button>
+            {allergyOpen && (
+              <div className="allergy-panel">
+                {ALLERGIES.map((item) => (
+                  <button
+                    key={item.label}
+                    type="button"
+                    className={allergies.includes(item.label) ? 'on' : undefined}
+                    onClick={() => toggleShelfAllergy(item.label)}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </header>
         <nav className="cats" aria-label="Categories">
-          <button type="button" className={category === 'All' ? 'on' : ''} onClick={() => setCategory('All')}>All</button>
-          {categories.map((name) => (
-            <button key={name} type="button" className={category === name ? 'on' : ''} onClick={() => setCategory(name)}>{name}</button>
+          <button type="button" className={aisle === 'All' ? 'on' : ''} onClick={() => { setAisle('All'); setLeaf(''); }}>All</button>
+          {aisles.map((name) => (
+            <button key={name} type="button" className={aisle === name ? 'on' : ''} onClick={() => { setAisle(name); setLeaf(''); }}>{name}</button>
           ))}
         </nav>
+        {leaves.length > 0 && (
+          <nav className="cats leaves" aria-label={aisle}>
+            {leaves.map((name) => (
+              <button key={name} type="button" className={leaf === name ? 'on' : ''} onClick={() => setLeaf(leaf === name ? '' : name)}>{name}</button>
+            ))}
+          </nav>
+        )}
         {shelf.length === 0 && <p className="empty">Nothing on the shelf matches that.</p>}
         <ul className="grid">
           {shelf.map((item) => (
             <li key={item.sku}>
               <button
                 type="button"
-                className="card"
+                className={blocked.some((allergy) => hasAllergy(item, allergy)) ? 'card blocked' : 'card'}
                 onClick={() => setProduct(item)}
               >
                 <img src={pictureFor(item.sku)} alt="" />
                 <span className="card-body">
+                  <em className="crumb">{item.category_path}</em>
                   <strong>{item.name}</strong>
                   <em>{qtyLabel(item.net_quantity)}</em>
                   <span className="foot">
@@ -446,10 +571,7 @@ function App() {
         <div className="dock-body" style={{ height: panelHeight }} aria-hidden={!open}>
           <div className="dock-panel" ref={panelRef}>
           <header className="assist-head">
-            <div>
-              <h1>Assistant</h1>
-              <p>Groceries for the fridge.</p>
-            </div>
+            <h1>Assistant</h1>
             <button
               type="button"
               className="close"
@@ -461,17 +583,57 @@ function App() {
           </header>
           <div className="thread" ref={threadRef}>
             <article className="bubble bot">
-              <p>{GREETING}</p>
-              {messages.length === 0 && (
+              {keyReady === false ? (
+                <p>
+                  Create <code>app/.env</code> and put <code>REACT_APP_GROK_API_KEY=your key</code> in that file. Restart the app after you save it.
+                </p>
+              ) : allergies.length > 0 ? (
+                <p>Leaving out {allergies.join(', ')}.</p>
+              ) : (
+                <p>Any allergy I should leave out?</p>
+              )}
+              {keyReady !== false && messages.length === 0 && !allergyDone && (
                 <div className="chips">
-                  {STARTS.map((item) => (
-                    <button key={item.label} type="button" onClick={() => send(item.text)}>
+                  <button type="button" onClick={() => { setAllergies([]); setAllergyDone(true); }}>
+                    No allergy
+                  </button>
+                  {ALLERGIES.map((item) => (
+                    <button
+                      key={item.label}
+                      type="button"
+                      className={allergies.includes(item.label) ? 'on' : undefined}
+                      onClick={() => toggleAllergy(item.label)}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                  {allergies.length > 0 && (
+                    <button type="button" className="on" onClick={() => setAllergyDone(true)}>
+                      Continue
+                    </button>
+                  )}
+                </div>
+              )}
+            </article>
+            {keyReady !== false && messages.length === 0 && allergyDone && (
+              <>
+              {allergyDone && (
+                <article className="bubble you">
+                  <p>{allergies.length ? allergies.join(', ') : 'No allergy'}</p>
+                </article>
+              )}
+              <article className="bubble bot">
+                <p>What groceries should go in the fridge?</p>
+                <div className="chips">
+                  {GROCERIES.map((item) => (
+                    <button key={item.label} type="button" onClick={() => send(shopText(item.text))}>
                       {item.label}
                     </button>
                   ))}
                 </div>
-              )}
-            </article>
+              </article>
+              </>
+            )}
             {messages.map((message, index) => (
               <div key={`${message.request}-${index}`} className="turn">
                 {message.request && <article className="bubble you"><p>{message.request}</p></article>}
@@ -497,14 +659,16 @@ function App() {
                     )}
                     {message.reply.baskets && (
                       <div className="offers">
-                        {message.reply.baskets.map((offer) => (
+                        {message.reply.baskets.map((offer) => {
+                          const comparison = offer.table === 'old';
+                          return (
                           <section key={offer.band} className="offer">
                             <header>
                               <span>{offer.band}</span>
                               <b>{money(offer.items.reduce((total, item) => total + (item.product.offers.price || 0) * qtyOf(index, offer.band, item), 0))}</b>
                             </header>
                             <h2>{offer.title}</h2>
-                            <p className="week">Groceries</p>
+                            <p className="week">{comparison ? 'Old sheet' : 'Corrected'}</p>
                             {offer.pitch && <p>{offer.pitch}</p>}
                             <ul>
                               {offer.items.map((item) => (
@@ -514,20 +678,28 @@ function App() {
                                     <span>
                                       <strong>{item.product.name}</strong>
                                       <em>{qtyLabel(item.product.net_quantity)} · {money(item.product.offers.price)}</em>
+                                      {item.allergenNote && <em className={item.allergenMissing ? 'warn' : ''}>{item.allergenNote}</em>}
                                     </span>
                                   </button>
-                                  <Stepper
-                                    value={qtyOf(index, offer.band, item)}
-                                    onChange={(next) => changeQty(index, offer.band, item.sku, next)}
-                                  />
+                                  {comparison ? (
+                                    <b className="compare-qty">×{qtyOf(index, offer.band, item)}</b>
+                                  ) : (
+                                    <Stepper
+                                      value={qtyOf(index, offer.band, item)}
+                                      onChange={(next) => changeQty(index, offer.band, item.sku, next)}
+                                    />
+                                  )}
                                 </li>
                               ))}
                             </ul>
-                            <button type="button" className="take" onClick={() => takeBasket(offer, index)}>
-                              Use this basket
-                            </button>
+                            {!comparison && (
+                              <button type="button" className="take" onClick={() => takeBasket(offer, index)}>
+                                Use this basket
+                              </button>
+                            )}
                           </section>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
                   </article>
@@ -546,6 +718,7 @@ function App() {
               onClick={dictation.toggle}
               aria-pressed={dictation.listening}
               aria-label={dictation.listening ? 'Stop voice' : 'Voice'}
+              disabled={keyReady === false}
             >
               <Mic />
             </button>
@@ -553,10 +726,11 @@ function App() {
               value={draft}
               onChange={(event) => { setDraft(event.target.value); setOpen(true); }}
               onFocus={() => setOpen(true)}
-              placeholder={askingInclude ? 'Choose yes or no above' : 'Groceries, or a meal plan…'}
+              placeholder={keyReady === false ? 'Add the key in app/.env' : askingInclude ? 'Choose yes or no above' : 'Groceries, or a meal plan…'}
               aria-label="What groceries do you want"
+              disabled={keyReady === false}
             />
-            <button type="submit" className="send" disabled={pending || askingInclude || !draft.trim()}>Send</button>
+            <button type="submit" className="send" disabled={keyReady === false || pending || askingInclude || !draft.trim()}>Send</button>
             {dictation.note && <p className="dock-note">{dictation.note}</p>}
           </form>
       </div>
